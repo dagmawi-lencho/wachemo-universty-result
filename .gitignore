@@ -1,0 +1,5 @@
+.env
+botenv/
+student.sql
+student.db
+__pycache__/

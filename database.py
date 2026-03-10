@@ -1,0 +1,115 @@
+# database.py
+"""This module is made to provide easy functions for my @AAU_Robot.
+This module provides function for creating, deleting table, inserting data
+deleting and from the table."""
+
+import sqlite3
+from datetime import date
+from typing import Optional, Tuple
+
+DB_PATH = "student.db"
+
+def create_table() -> None:
+    """Creates a table; this is usually performed once."""
+
+    try:
+        with sqlite3.connect(DB_PATH) as database:
+            cursor = database.cursor()
+            create = """
+                CREATE TABLE IF NOT EXISTS Student (
+                    TGID TEXT PRIMARY KEY NOT NULL,
+                    IDNO TEXT NOT NULL,
+                    USERNAME TEXT NOT NULL,
+                    CAMPUS TEXT NOT NULL,
+                    JOINDATE DATE NOT NULL
+                )
+            """
+            cursor.execute(create)
+
+    except sqlite3.Error as error:
+        print(error)
+
+def insert_data(values: tuple) -> bool:
+    """Inserts user information into the database."""
+
+    try:
+        with sqlite3.connect(DB_PATH) as database:
+            cursor = database.cursor()
+            insertdata = """
+                INSERT INTO Student (TGID, IDNO, USERNAME, CAMPUS, JOINDATE)
+                VALUES (?, ?, ?, ?, ?)
+            """
+            cursor.execute(insertdata, values)
+            database.commit()
+            return True
+    except sqlite3.Error as error:
+        print(error)
+        return False
+
+def registered_count() -> int:
+    """Function that gets the number of tuples in the table."""
+
+    with sqlite3.connect(DB_PATH) as database:
+        cursor = database.cursor()
+        select_all = """SELECT TGID FROM Student"""
+        cursor.execute(select_all)
+        table = cursor.fetchall()
+        return len(table)
+
+def registered_today() -> int:
+    """Function that gets the number of tuples with today's date in the table."""
+
+    today = date.today().strftime("%d/%m/%Y")
+
+    with sqlite3.connect(DB_PATH) as database:
+        cursor = database.cursor()
+        select = """SELECT * FROM Student WHERE JOINDATE = ?"""
+        cursor.execute(select, (today,))
+        table = cursor.fetchall()
+        return len(table)
+
+def search_table_by_tg_id(tg_id) -> Optional[Tuple]:
+    """Search for a record based on TGID and return one record if found."""
+    try:
+        with sqlite3.connect(DB_PATH) as database:
+            cursor = database.cursor()
+            search = """SELECT * FROM Student WHERE TGID = ?"""
+            cursor.execute(search, (str(tg_id),))
+            row = cursor.fetchone()
+            return row
+    except sqlite3.Error as e:
+        print(e)
+
+def delete_table_data():
+    """Delete all records in the Student table."""
+    try:
+        with sqlite3.connect(DB_PATH) as database:
+            cursor = database.cursor()
+            delete = """DELETE FROM Student"""
+            cursor.execute(delete)
+            database.commit()
+    except sqlite3.Error as error:
+        print(error)
+
+
+def delete_from_table(key):
+    """Delete a specific user from the table based on TGID."""
+    try:
+        with sqlite3.connect(DB_PATH) as database:
+            cursor = database.cursor()
+            delete_row = """DELETE FROM Student WHERE TGID=?"""
+            cursor.execute(delete_row, (str(key),))
+            database.commit()
+    except sqlite3.Error as e:
+        print(e)
+
+def modify_idno(tg_id, new_idno) -> None:
+    """Modify the IDNO for a specific user based on TGID."""
+    try:
+        with sqlite3.connect(DB_PATH) as database:
+            cursor = database.cursor()
+            update_idno = """UPDATE Student SET IDNO=? WHERE TGID=?"""
+            cursor.execute(update_idno, (new_idno, tg_id))
+            database.commit()
+    except sqlite3.Error as e:
+        print(e)
