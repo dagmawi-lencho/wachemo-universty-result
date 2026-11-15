@@ -6,7 +6,7 @@ declare(strict_types=1);
  * Terminal-only tool: prints the structure of the grade report and home pages for the most
  * recently active logged-in session, with letter grades and GPA values masked.
  *
- * Usage: php inspect.php [grades|home]
+ * Usage: php inspect.php [grades|home] [N]   (N = Nth most recently active session, default 1)
  */
 
 if (PHP_SAPI !== 'cli') {
@@ -23,7 +23,8 @@ $pdo = new PDO(
     $db['user'],
     $db['password']
 );
-$row = $pdo->query('SELECT portal_session FROM wcu_users WHERE portal_expires_at > UNIX_TIMESTAMP() ORDER BY updated_at DESC LIMIT 1')->fetch(PDO::FETCH_ASSOC);
+$offset = max(0, (int) ($argv[2] ?? 1) - 1);
+$row = $pdo->query("SELECT portal_session FROM wcu_users WHERE portal_expires_at > UNIX_TIMESTAMP() ORDER BY updated_at DESC LIMIT 1 OFFSET {$offset}")->fetch(PDO::FETCH_ASSOC);
 $state = $row ? json_decode((string) (new Crypto($config['secret_key']))->decrypt($row['portal_session']), true) : null;
 if (!is_array($state)) {
     exit("No active session. Log in to the bot first, then run this within 30 minutes.\n");
