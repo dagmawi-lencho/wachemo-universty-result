@@ -1,5 +1,5 @@
 Options -Indexes
 
-<FilesMatch "^(config\.php|config\.example\.php|schema\.sql|\.gitignore)$">
+<FilesMatch "^(config\.php|config\.example\.php|schema\.sql|\.gitignore)$|\.(log|old)$">
     Require all denied
 </FilesMatch>

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 require __DIR__ . '/Text.php';
 require __DIR__ . '/Html.php';
+require __DIR__ . '/Diagnostics.php';
 require __DIR__ . '/Crypto.php';
 require __DIR__ . '/Store.php';
 require __DIR__ . '/Telegram.php';
@@ -27,6 +28,7 @@ function wcu_config(): array
     foreach ($candidates as $path) {
         if (is_file($path)) {
             $config = require $path;
+            Diagnostics::setFile(dirname($path) . '/wcu-bot-diagnostics.log');
             break;
         }
     }

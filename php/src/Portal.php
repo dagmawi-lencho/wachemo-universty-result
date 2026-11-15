@@ -17,16 +17,27 @@ final class PortalClient
     public const BASE_URL = 'https://portal.wcu.edu.et/';
     private const USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36';
     private const TIMEOUT = 12;
-    private const DEFAULT_IMAGE = 'https://i.imgur.com/6zZ9b8Z.png';
+    private const MAX_CANDIDATE_PAGES = 8;
 
-    private const GRADE_MARKERS = ['academic status', 'cgpa', 'course', 'grade', 'result', 'semester'];
-    private const PROFILE_MARKERS = ['full name', 'id no', 'department', 'year', 'profile'];
+    private const GRADE_KEYWORDS = ['grade', 'result', 'transcript', 'report', 'academic'];
+    private const PROFILE_KEYWORDS = ['profile', 'home', 'dashboard', 'student', 'basic', 'info'];
+    /** Links the candidate search must never open: they end the session or change data. */
+    private const UNSAFE_LINK_PATTERN = '/log\s*off|log-?out|sign-?out|delete|remove|drop|cancel|withdraw/i';
+    /** Public areas that are not tied to the logged-in student. */
+    private const PUBLIC_LINK_PATTERN = '#/(newstudents|web|account)(/|$)#i';
+
     private const PROFILE_PATTERNS = [
         'full name' => '/(*UCP)full\s*name\s*[:\-]\s*([^\n]+)/iu',
         'id no' => '/(*UCP)(?:id\s*no|id\s*number|student\s*id)\s*[:\-]\s*([^\n]+)/iu',
         'department' => '/(*UCP)department\s*[:\-]\s*([^\n]+)/iu',
         'year' => '/(*UCP)year\s*[:\-]\s*([^\n]+)/iu',
         'placed department' => '/(*UCP)(?:placed|placement)\s*department\s*[:\-]\s*([^\n]+)/iu',
+    ];
+    private const PROFILE_ALIASES = [
+        'name' => ['full name', 'student name', 'name', 'applicant name'],
+        'id' => ['id no', 'id number', 'student id', 'idno'],
+        'department' => ['department', 'placed department', 'placement department', 'program', 'stream'],
+        'year' => ['year', 'batch', 'academic year', 'study year'],
     ];
     private const SKIP_VALUES = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '2.00', '3.00', '4.00', '5.00'];
 
@@ -111,9 +122,6 @@ final class PortalClient
             $action = $forms ? $forms[0]->getAttribute('action') : '/login';
             $response = $this->request(Html::urljoin(self::BASE_URL, $action), $payload);
 
-            $finalUrl = $response['url'];
-            $this->loginLinks = $this->collectLinks($response['body']);
-
             [, $errorXpath] = Html::load($response['body']);
             $errorElement = Html::firstWithClass($errorXpath, 'span', 'field-validation-error')
                 ?? Html::firstWithClass($errorXpath, 'div', 'validation-summary-errors')
@@ -128,19 +136,17 @@ final class PortalClient
                 if (Text::contains($errorText, 'attempt')) {
                     return $errorText;
                 }
-                return $errorText !== '' ? $errorText : 'Invalid credentials.';
+                if ($errorText !== '' || self::isLoginPage($response)) {
+                    return $errorText !== '' ? $errorText : 'Invalid credentials.';
+                }
             }
 
-            $finalLower = strtolower($finalUrl);
-            if (Text::contains($finalLower, '/home') || Text::contains($finalLower, '/grade/gradereport')) {
-                $this->loggedIn = true;
-                return null;
-            }
-            if (self::isLoginUrl($finalUrl)) {
+            if (self::isLoginPage($response)) {
                 return 'Incorrect username or password.';
             }
 
             $this->loggedIn = true;
+            $this->loginLinks = $this->collectLinks($response['body']);
             return null;
         } catch (PortalException $e) {
             if ($e->getCode() === PortalException::TIMEOUT) {
@@ -153,7 +159,7 @@ final class PortalClient
     }
 
     /**
-     * @return array{0: string, 1: string}|string [image URL, profile details] or an error message.
+     * @return array{0: ?string, 1: string}|string [photo URL or null, profile details] or a message for the user.
      */
     public function getProfile()
     {
@@ -169,40 +175,27 @@ final class PortalClient
 
         try {
             $response = $this->request(self::BASE_URL . 'Home');
-            if ($response['status'] !== 200) {
-                return "Profile fetch failed: HTTP {$response['status']}.";
-            }
-            if (self::isLoginUrl($response['url'])) {
-                $this->sessionExpired = true;
-                return 'Profile fetch failed: session expired or login failed.';
+            $problem = $this->checkResponse($response, 'Profile');
+            if ($problem !== null) {
+                return $problem;
             }
 
-            if (!self::looksLike($response['body'], self::PROFILE_MARKERS)) {
-                $candidate = $this->findCandidatePage(['home', 'profile', 'dashboard', 'student'], self::PROFILE_MARKERS);
-                if ($candidate !== null) {
-                    $response = $candidate;
+            $profile = $this->parseProfile($response['body']);
+            if ($profile === null) {
+                $found = $this->searchLinks($response['body'], self::PROFILE_KEYWORDS, function (string $html): bool {
+                    return $this->parseProfile($html) !== null;
+                });
+                if ($this->sessionExpired) {
+                    return 'Profile fetch failed: session expired or login failed.';
                 }
+                if ($found === null) {
+                    Diagnostics::record('profile-unreadable', self::describe($response));
+                    return self::unreadableMessage('profile', $response);
+                }
+                $profile = $this->parseProfile($found['body']);
             }
 
-            [$dom, $xpath] = Html::load($response['body']);
-
-            $image = Html::firstWithClass($xpath, 'img', 'img-rounded');
-            $src = $image !== null ? $image->getAttribute('src') : '';
-            if ($src === '') {
-                $imageUrl = self::DEFAULT_IMAGE;
-            } elseif (Text::startsWith($src, 'http://') || Text::startsWith($src, 'https://')) {
-                $imageUrl = $src;
-            } else {
-                $imageUrl = rtrim(self::BASE_URL, '/') . '/' . ltrim($src, '/');
-            }
-
-            $data = $this->extractProfileFields($dom, $xpath);
-            $details = 'Full Name: ' . self::firstAvailable($data, ['full name', 'student name', 'name', 'applicant name']) . "\n"
-                . 'ID No.: ' . self::firstAvailable($data, ['id no', 'id number', 'student id', 'idno']) . "\n"
-                . 'Department: ' . self::firstAvailable($data, ['department', 'placed department', 'placement department', 'program', 'stream']) . "\n"
-                . 'Year: ' . self::firstAvailable($data, ['year', 'batch', 'academic year', 'study year']);
-
-            $this->cachedProfile = [$imageUrl, $details];
+            $this->cachedProfile = $profile;
             return $this->cachedProfile;
         } catch (Throwable $e) {
             return 'Profile fetch failed: ' . $e->getMessage();
@@ -210,7 +203,7 @@ final class PortalClient
     }
 
     /**
-     * @return string[]|string Raw semester blocks, or an error message.
+     * @return string[]|string Raw semester blocks, or a message for the user.
      */
     public function getGrades()
     {
@@ -226,40 +219,27 @@ final class PortalClient
 
         try {
             $response = $this->request(self::BASE_URL . 'Grade/GradeReport');
-            if ($response['status'] !== 200) {
-                return "Grades fetch failed: HTTP {$response['status']}.";
-            }
-            if (self::isLoginUrl($response['url'])) {
-                $this->sessionExpired = true;
-                return 'Grades fetch failed: session expired or login failed.';
+            $problem = $this->checkResponse($response, 'Grades');
+            if ($problem !== null) {
+                return $problem;
             }
 
-            if (!self::looksLike($response['body'], self::GRADE_MARKERS)) {
-                $candidate = $this->findCandidatePage(['grade', 'result', 'transcript', 'report'], self::GRADE_MARKERS);
-                if ($candidate !== null) {
-                    $response = $candidate;
+            $semesters = self::parseSemesters($response['body']);
+            if (!self::hasGradeContent($semesters)) {
+                $found = $this->searchLinks($response['body'], self::GRADE_KEYWORDS, function (string $html): bool {
+                    return self::hasGradeContent(self::parseSemesters($html));
+                });
+                if ($this->sessionExpired) {
+                    return 'Grades fetch failed: session expired or login failed.';
                 }
+                if ($found === null) {
+                    Diagnostics::record('grades-unreadable', self::describe($response));
+                    return self::unreadableMessage('grade report', $response);
+                }
+                $semesters = self::parseSemesters($found['body']);
             }
 
-            [, $xpath] = Html::load($response['body']);
-            $semesters = [];
-            $current = [];
-            foreach (Html::query($xpath, '//td') as $cell) {
-                $text = Html::text($cell);
-                if ($text === '' || in_array($text, self::SKIP_VALUES, true) || Text::contains($text, 'Assessment')) {
-                    continue;
-                }
-                $current[] = $text;
-                if (Text::contains($text, 'Academic Status') || Text::contains($text, 'CGPA')) {
-                    $semesters[] = implode("\n", $current);
-                    $current = [];
-                }
-            }
-            if ($current) {
-                $semesters[] = implode("\n", $current);
-            }
-
-            $this->cachedGrades = $semesters ?: ['No grades available yet.'];
+            $this->cachedGrades = $semesters;
             return $this->cachedGrades;
         } catch (Throwable $e) {
             return 'Grades fetch failed: ' . $e->getMessage();
@@ -278,31 +258,28 @@ final class PortalClient
             }
         }
 
-        $endpoints = [self::BASE_URL . 'Home', self::BASE_URL . 'NewStudents/Profile', self::BASE_URL . 'NewStudents/Welcome'];
-        foreach ($endpoints as $endpoint) {
-            try {
-                $response = $this->request($endpoint);
-            } catch (PortalException $e) {
-                continue;
-            }
-            if ($response['status'] !== 200 || self::isLoginUrl($response['url'])) {
-                continue;
-            }
-
-            [$dom, $xpath] = Html::load($response['body']);
-            $data = $this->extractProfileFields($dom, $xpath);
-            $department = self::firstAvailable(
-                $data,
-                ['placed department', 'placement department', 'department', 'stream', 'program'],
-                ''
-            );
-            if ($department !== '') {
-                $this->cachedPlacement = '🏫 Placed Department: ' . $department;
-                return $this->cachedPlacement;
-            }
+        try {
+            $response = $this->request(self::BASE_URL . 'Home');
+        } catch (PortalException $e) {
+            return 'Failed to connect to the portal. Please try again.';
+        }
+        $problem = $this->checkResponse($response, 'Placement');
+        if ($problem !== null) {
+            return $problem;
         }
 
-        $this->cachedPlacement = "I couldn't find your placed department yet. It may not be published on the portal.";
+        $data = $this->extractProfileFields($response['body']);
+        $department = self::firstAvailable(
+            $data,
+            ['placed department', 'placement department', 'department', 'stream', 'program'],
+            ''
+        );
+        if ($department === '') {
+            return "I couldn't find a placed department on your portal account yet.\n\n"
+                . 'Freshman placement results are published at https://portal.wcu.edu.et/NewStudents/DepartmentPlacementStatus';
+        }
+
+        $this->cachedPlacement = '🏫 Placed Department: ' . $department;
         return $this->cachedPlacement;
     }
 
@@ -316,12 +293,81 @@ final class PortalClient
         } catch (PortalException $e) {
             return null;
         }
-        return $response['status'] === 200 && $response['body'] !== '' ? $response['body'] : null;
+        if ($response['status'] !== 200 || $response['body'] === '' || self::isLoginPage($response)) {
+            return null;
+        }
+        return $response['body'];
     }
 
     public static function isPortalUrl(string $url): bool
     {
         return Html::host($url) === Html::host(self::BASE_URL);
+    }
+
+    /**
+     * Raw semester blocks from a grade report page: table cells grouped until a CGPA/status cell.
+     *
+     * @return string[]
+     */
+    public static function parseSemesters(string $html): array
+    {
+        [, $xpath] = Html::load($html);
+        $semesters = [];
+        $current = [];
+        foreach (Html::query($xpath, '//td') as $cell) {
+            $text = Html::text($cell);
+            if ($text === '' || in_array($text, self::SKIP_VALUES, true) || Text::contains($text, 'Assessment')) {
+                continue;
+            }
+            $current[] = $text;
+            if (Text::contains($text, 'Academic Status') || Text::contains($text, 'CGPA')) {
+                $semesters[] = implode("\n", $current);
+                $current = [];
+            }
+        }
+        if ($current) {
+            $semesters[] = implode("\n", $current);
+        }
+        return $semesters;
+    }
+
+    /**
+     * @param string[] $semesters
+     */
+    public static function hasGradeContent(array $semesters): bool
+    {
+        foreach ($semesters as $semester) {
+            if (preg_match('/Academic\s*Year|CGPA|SGPA|Academic\s*Status/i', $semester)) {
+                return true;
+            }
+            foreach (Text::lines($semester) as $line) {
+                if (Format::isCourseCode($line)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * @return array{0: ?string, 1: string}|null null when the page has no student profile fields.
+     */
+    public function parseProfile(string $html): ?array
+    {
+        $data = $this->extractProfileFields($html);
+        $values = [];
+        foreach (self::PROFILE_ALIASES as $field => $aliases) {
+            $values[$field] = self::firstAvailable($data, $aliases, '');
+        }
+        if ($values['name'] === '' && $values['id'] === '') {
+            return null;
+        }
+
+        $details = 'Full Name: ' . ($values['name'] !== '' ? $values['name'] : 'N/A') . "\n"
+            . 'ID No.: ' . ($values['id'] !== '' ? $values['id'] : 'N/A') . "\n"
+            . 'Department: ' . ($values['department'] !== '' ? $values['department'] : 'N/A') . "\n"
+            . 'Year: ' . ($values['year'] !== '' ? $values['year'] : 'N/A');
+        return [$this->findPhotoUrl($html), $details];
     }
 
     /**
@@ -400,23 +446,107 @@ final class PortalClient
         return is_array($list) ? array_values($list) : [];
     }
 
-    private static function isLoginUrl(string $url): bool
+    /**
+     * Common checks for a page fetched with the session; returns a user message when it is unusable.
+     */
+    private function checkResponse(array $response, string $what): ?string
     {
-        return Text::contains(strtolower($url), '/login');
+        if (self::isLoginPage($response)) {
+            $this->sessionExpired = true;
+            return "{$what} fetch failed: session expired or login failed. Please log in again.";
+        }
+        if ($response['status'] !== 200) {
+            return "{$what} fetch failed: HTTP {$response['status']}. The portal may be busy, please try again.";
+        }
+        return null;
     }
 
     /**
-     * @param string[] $markers
+     * Whether a response is the portal's login form (redirected there, or the form itself).
      */
-    private static function looksLike(string $html, array $markers): bool
+    private static function isLoginPage(array $response): bool
     {
-        $lowered = strtolower($html);
-        foreach ($markers as $marker) {
-            if (Text::contains($lowered, $marker)) {
-                return true;
+        $path = strtolower((string) parse_url($response['url'], PHP_URL_PATH));
+        if (preg_match('#/(account/)?login$#', rtrim($path, '/'))) {
+            return true;
+        }
+        $body = $response['body'];
+        return preg_match('/<form[^>]+action=["\'][^"\']*login[^"\']*["\']/i', $body) === 1
+            && preg_match('/<input[^>]+name=["\']?UserName\b/i', $body) === 1
+            && preg_match('/<input[^>]+type=["\']?password\b/i', $body) === 1;
+    }
+
+    /**
+     * Explain to the student what the portal showed instead of the expected page.
+     */
+    private static function unreadableMessage(string $what, array $response): string
+    {
+        $info = self::describe($response);
+        $title = $info['title'] !== '' ? $info['title'] : ($info['headings'][0] ?? $info['path']);
+        $haystack = strtolower($info['path'] . ' ' . $info['title'] . ' ' . implode(' ', $info['headings']) . ' ' . implode(' ', $info['forms']));
+
+        if (preg_match('/change\s*password|changepassword|reset\s*password/', $haystack)) {
+            return "🔐 The portal is asking you to change your password first.\n\n"
+                . "Open https://portal.wcu.edu.et/ in a browser, log in, change your password, then come back and log in here with the new password.";
+        }
+        if (preg_match('/evaluat|survey|questionnaire/', $haystack)) {
+            return "📝 The portal requires you to complete the instructor evaluation first.\n\n"
+                . 'Open https://portal.wcu.edu.et/ in a browser, finish the evaluation, then try again here.';
+        }
+        if (preg_match('/payment|fee|debt|clearance|cost\s*sharing/', $haystack)) {
+            return "💳 The portal is holding your {$what} (payment or clearance).\n\n"
+                . 'Open https://portal.wcu.edu.et/ in a browser to see what is required, then try again here.';
+        }
+        if ($what === 'grade report' && preg_match('/grade|result|transcript/', $haystack)) {
+            return "📭 No grades have been published on the portal for your account yet.\n\n"
+                . 'Please check again after results are released.';
+        }
+        return "⚠️ I couldn't find your {$what} on the portal. The portal showed the page \"{$title}\" instead.\n\n"
+            . 'Open https://portal.wcu.edu.et/ in a browser to check whether something needs your attention, then try again here.';
+    }
+
+    /**
+     * Structure of a page for diagnostics: no table contents or form values.
+     */
+    private static function describe(array $response): array
+    {
+        [, $xpath] = Html::load($response['body']);
+        $titles = Html::query($xpath, '//title');
+        $headings = [];
+        foreach (Html::query($xpath, '//h1|//h2|//h3|//h4|//h5') as $heading) {
+            $text = Html::text($heading, ' ');
+            if ($text !== '') {
+                $headings[] = Text::slice($text, 80);
+            }
+            if (count($headings) >= 8) {
+                break;
             }
         }
-        return false;
+        $forms = [];
+        foreach (Html::query($xpath, '//form') as $form) {
+            $forms[] = $form->getAttribute('action');
+        }
+        $links = [];
+        foreach (Html::query($xpath, '//a[@href]') as $anchor) {
+            $path = (string) parse_url(Html::urljoin(self::BASE_URL, trim($anchor->getAttribute('href'))), PHP_URL_PATH);
+            if ($path !== '' && !in_array($path, $links, true)) {
+                $links[] = $path;
+            }
+            if (count($links) >= 30) {
+                break;
+            }
+        }
+        $url = parse_url($response['url']);
+        return [
+            'status' => $response['status'],
+            'path' => ($url['path'] ?? '') . (isset($url['query']) ? '?' . $url['query'] : ''),
+            'title' => $titles ? Text::slice(Html::text($titles[0], ' '), 120) : '',
+            'headings' => $headings,
+            'forms' => $forms,
+            'tables' => count(Html::query($xpath, '//table')),
+            'cells' => count(Html::query($xpath, '//td')),
+            'links' => $links,
+        ];
     }
 
     /**
@@ -439,26 +569,38 @@ final class PortalClient
             if ($host !== '' && !Text::contains($host, $baseHost)) {
                 continue;
             }
-            $links[$full] = true;
+            $links[strtok($full, '#')] = true;
         }
         return array_keys($links);
     }
 
     /**
-     * Walk links found on the post-login page (preferred keywords first) until one looks right.
+     * Open links from the given page and the post-login page (keyword matches first)
+     * until one passes $accept. Never opens logout/destructive or public links.
      *
      * @param string[] $prefer
-     * @param string[] $markers
      */
-    private function findCandidatePage(array $prefer, array $markers): ?array
+    private function searchLinks(string $html, array $prefer, callable $accept): ?array
     {
+        $tried = [
+            strtolower(self::BASE_URL . 'Home') => true,
+            strtolower(self::BASE_URL . 'Grade/GradeReport') => true,
+            strtolower(self::BASE_URL) => true,
+        ];
         $preferred = [];
         $others = [];
-        foreach ($this->loginLinks as $link) {
-            $lowered = strtolower($link);
+        foreach (array_merge($this->collectLinks($html), $this->loginLinks) as $link) {
+            $key = strtolower(rtrim($link, '/'));
+            $path = (string) parse_url($link, PHP_URL_PATH);
+            if (isset($tried[$key]) || isset($tried[$key . '/'])
+                || preg_match(self::UNSAFE_LINK_PATTERN, $link)
+                || preg_match(self::PUBLIC_LINK_PATTERN, $path)) {
+                continue;
+            }
+            $tried[$key] = true;
             $matched = false;
             foreach ($prefer as $keyword) {
-                if (Text::contains($lowered, $keyword)) {
+                if (Text::contains(strtolower($link), $keyword)) {
                     $matched = true;
                     break;
                 }
@@ -470,17 +612,47 @@ final class PortalClient
             }
         }
 
-        foreach (array_merge($preferred, $others) as $link) {
+        foreach (array_slice(array_merge($preferred, $others), 0, self::MAX_CANDIDATE_PAGES) as $link) {
             try {
                 $response = $this->request($link);
             } catch (PortalException $e) {
                 continue;
             }
-            if ($response['status'] === 200 && self::looksLike($response['body'], $markers)) {
+            if (self::isLoginPage($response)) {
+                $this->sessionExpired = true;
+                return null;
+            }
+            if ($response['status'] === 200 && $accept($response['body'])) {
                 return $response;
             }
         }
         return null;
+    }
+
+    private function findPhotoUrl(string $html): ?string
+    {
+        [, $xpath] = Html::load($html);
+        $src = '';
+        $image = Html::firstWithClass($xpath, 'img', 'img-rounded');
+        if ($image !== null) {
+            $src = trim($image->getAttribute('src'));
+        }
+        if ($src === '') {
+            foreach (Html::query($xpath, '//img[@src]') as $candidate) {
+                $value = trim($candidate->getAttribute('src'));
+                if (preg_match('/photo|picture|avatar|student/i', $value) && !preg_match('/logo/i', $value)) {
+                    $src = $value;
+                    break;
+                }
+            }
+        }
+        if ($src === '' || Text::startsWith($src, 'data:')) {
+            return null;
+        }
+        if (Text::startsWith($src, 'http://') || Text::startsWith($src, 'https://')) {
+            return $src;
+        }
+        return rtrim(self::BASE_URL, '/') . '/' . ltrim($src, '/');
     }
 
     private function findIncorrectListItem(DOMXPath $xpath): ?DOMElement
@@ -505,8 +677,9 @@ final class PortalClient
      *
      * @return array<string, string>
      */
-    private function extractProfileFields(DOMDocument $dom, DOMXPath $xpath): array
+    private function extractProfileFields(string $html): array
     {
+        [$dom, $xpath] = Html::load($html);
         $extracted = [];
 
         foreach (Html::query($xpath, '//tr') as $row) {
@@ -520,7 +693,7 @@ final class PortalClient
             }
         }
 
-        foreach (Html::query($xpath, '//label|//strong|//b|//span|//div|//p') as $tag) {
+        foreach (Html::query($xpath, '//label|//strong|//b|//span|//div|//p|//dt|//li') as $tag) {
             $text = Html::text($tag, ' ');
             $colon = strpos($text, ':');
             if ($colon === false) {
@@ -530,6 +703,20 @@ final class PortalClient
             $value = Text::strip(substr($text, $colon + 1));
             if ($key !== '' && $value !== '') {
                 $extracted[$key] = $value;
+            }
+        }
+
+        foreach (Html::query($xpath, '//dt') as $term) {
+            $next = $term->nextSibling;
+            while ($next !== null && !($next instanceof DOMElement)) {
+                $next = $next->nextSibling;
+            }
+            if ($next instanceof DOMElement && strtolower($next->nodeName) === 'dd') {
+                $key = self::normalizeLabel(Html::text($term, ' '));
+                $value = Html::text($next, ' ');
+                if ($key !== '' && $value !== '') {
+                    $extracted[$key] = $value;
+                }
             }
         }
 

@@ -321,30 +321,31 @@ final class Bot
             }
 
             [$imageUrl, $caption] = $profile;
+            $photo = null;
+            if ($imageUrl !== null) {
+                $photo = PortalClient::isPortalUrl($imageUrl) ? $client->download($imageUrl) : null;
+                if ($photo !== null && !self::looksLikeImage($photo)) {
+                    $photo = null;
+                }
+            }
+            if ($photo === null && ($imageUrl === null || PortalClient::isPortalUrl($imageUrl))) {
+                $this->renderPanel("👤 Profile\n\n{$caption}", self::backMarkup());
+                return;
+            }
+
             $panelId = $this->data['panel_message_id'] ?? null;
             unset($this->data['panel_message_id']);
             if ($panelId) {
                 $this->tg->deleteMessage($this->chatId, (int) $panelId);
             }
-
-            $sent = null;
-            if (!PortalClient::isPortalUrl($imageUrl)) {
-                $sent = $this->tg->sendPhotoUrl($this->chatId, $imageUrl, $caption, self::backMarkup());
-            }
-            if ($sent === null) {
-                $bytes = $client->download($imageUrl);
-                if ($bytes !== null) {
-                    $sent = $this->tg->sendPhotoBytes($this->chatId, $bytes, $caption, self::backMarkup());
-                }
-            }
+            $sent = $photo !== null
+                ? $this->tg->sendPhotoBytes($this->chatId, $photo, $caption, self::backMarkup())
+                : $this->tg->sendPhotoUrl($this->chatId, (string) $imageUrl, $caption, self::backMarkup());
 
             if ($sent !== null) {
                 $this->data['active_profile_message_id'] = $sent['message_id'];
             } else {
-                $this->renderPanel(
-                    "👤 Profile\n\n{$caption}\n\n(Profile photo unavailable right now.)",
-                    self::backMarkup()
-                );
+                $this->renderPanel("👤 Profile\n\n{$caption}", self::backMarkup());
             }
             return;
         }
@@ -695,6 +696,15 @@ final class Bot
         $command = substr($text, 1, max(0, (int) $entity['length'] - 1));
         $command = strtolower(explode('@', $command, 2)[0]);
         return $command === $name;
+    }
+
+    private static function looksLikeImage(string $bytes): bool
+    {
+        $head = substr($bytes, 0, 12);
+        return Text::startsWith($head, "\xFF\xD8\xFF")
+            || Text::startsWith($head, "\x89PNG")
+            || Text::startsWith($head, 'GIF8')
+            || (Text::startsWith($head, 'RIFF') && substr($head, 8, 4) === 'WEBP');
     }
 
     private static function button(string $text, string $callbackData): array
