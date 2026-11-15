@@ -1,0 +1,13 @@
+CREATE TABLE IF NOT EXISTS wcu_users (
+    tg_id BIGINT NOT NULL PRIMARY KEY,
+    conv_state VARCHAR(32) NULL,
+    user_data MEDIUMTEXT NULL,
+    portal_session MEDIUMTEXT NULL,
+    portal_expires_at INT UNSIGNED NOT NULL DEFAULT 0,
+    updated_at INT UNSIGNED NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS wcu_updates (
+    update_id BIGINT NOT NULL PRIMARY KEY,
+    received_at INT UNSIGNED NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
