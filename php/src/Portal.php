@@ -26,6 +26,13 @@ final class PortalClient
     /** Public areas that are not tied to the logged-in student. */
     private const PUBLIC_LINK_PATTERN = '#/(newstudents|web|account)(/|$)#i';
 
+    private const PROFILE_FORM_NOTICE = "📝 The WCU portal is asking you to complete your Student Profile first "
+        . "(Personal Details, Mother, High School and Guardian information).\n\n"
+        . "Until it is filled in and saved, the portal hides your grades and department.\n\n"
+        . "1. Open https://portal.wcu.edu.et/ in a browser and log in.\n"
+        . "2. Fill every required (*) field on each tab and press Save.\n"
+        . "3. Come back here and press /start to log in again.";
+
     private const PROFILE_PATTERNS = [
         'full name' => '/(*UCP)full\s*name\s*[:\-]\s*([^\n]+)/iu',
         'id no' => '/(*UCP)(?:id\s*no|id\s*number|student\s*id)\s*[:\-]\s*([^\n]+)/iu',
@@ -68,7 +75,8 @@ final class PortalClient
         $client->loggedIn = (bool) ($state['logged_in'] ?? false);
         $client->loginLinks = $state['login_links'] ?? [];
         $client->cachedProfile = $state['profile'] ?? null;
-        $client->cachedGrades = $state['grades'] ?? null;
+        $grades = $state['grades'] ?? null;
+        $client->cachedGrades = is_array($grades) && is_array(reset($grades)) ? $grades : null;
         $client->cachedPlacement = $state['placement'] ?? null;
         return $client;
     }
@@ -194,6 +202,9 @@ final class PortalClient
                 }
                 $profile = $this->parseProfile($found['body']);
             }
+            if (self::isProfileFormPage($response)) {
+                $profile[1] .= "\n\n" . self::PROFILE_FORM_NOTICE;
+            }
 
             $this->cachedProfile = $profile;
             return $this->cachedProfile;
@@ -203,7 +214,7 @@ final class PortalClient
     }
 
     /**
-     * @return string[]|string Raw semester blocks, or a message for the user.
+     * @return array[]|string Semesters (see Format::semester()), or a message for the user.
      */
     public function getGrades()
     {
@@ -223,11 +234,14 @@ final class PortalClient
             if ($problem !== null) {
                 return $problem;
             }
+            if (self::isProfileFormPage($response)) {
+                return self::unreadableMessage('grade report', $response);
+            }
 
-            $semesters = self::parseSemesters($response['body']);
-            if (!self::hasGradeContent($semesters)) {
+            $semesters = self::extractSemesters($response['body']);
+            if (!$semesters) {
                 $found = $this->searchLinks($response['body'], self::GRADE_KEYWORDS, function (string $html): bool {
-                    return self::hasGradeContent(self::parseSemesters($html));
+                    return self::extractSemesters($html) !== [];
                 });
                 if ($this->sessionExpired) {
                     return 'Grades fetch failed: session expired or login failed.';
@@ -236,7 +250,7 @@ final class PortalClient
                     Diagnostics::record('grades-unreadable', self::describe($response));
                     return self::unreadableMessage('grade report', $response);
                 }
-                $semesters = self::parseSemesters($found['body']);
+                $semesters = self::extractSemesters($found['body']);
             }
 
             $this->cachedGrades = $semesters;
@@ -266,6 +280,9 @@ final class PortalClient
         $problem = $this->checkResponse($response, 'Placement');
         if ($problem !== null) {
             return $problem;
+        }
+        if (self::isProfileFormPage($response)) {
+            return self::PROFILE_FORM_NOTICE;
         }
 
         $data = $this->extractProfileFields($response['body']);
@@ -305,6 +322,147 @@ final class PortalClient
     }
 
     /**
+     * Semesters from a grade report page. Reads the WCU grade table by its column headers;
+     * falls back to grouping raw cells for unknown layouts. Returns [] when the page has no
+     * results (no Academic Year / SGPA / CGPA anywhere), e.g. a plain course catalogue.
+     *
+     * @return array[]
+     */
+    public static function extractSemesters(string $html): array
+    {
+        $semesters = self::parseGradeTables($html);
+        if (!$semesters) {
+            $raw = self::parseSemesters($html);
+            if (self::hasGradeContent($raw)) {
+                $semesters = array_map([Format::class, 'semesterFromRaw'], $raw);
+            }
+        }
+        foreach ($semesters as $semester) {
+            if ($semester['year'] !== '' || $semester['summary']) {
+                return $semesters;
+            }
+        }
+        return [];
+    }
+
+    /**
+     * WCU layout: a table whose header row has Code and Grade columns; a full-width row
+     * "Academic Year : 2025/26, Year II, Semester : Two" starts each semester, course rows follow,
+     * and a full-width "SGP : … SGPA : … CGP : … CGPA : … Academic Status : …" row ends it.
+     *
+     * @return array[]
+     */
+    public static function parseGradeTables(string $html): array
+    {
+        [, $xpath] = Html::load($html);
+        $semesters = [];
+        foreach (Html::query($xpath, '//table') as $table) {
+            $columns = null;
+            $current = null;
+            foreach (Html::query($xpath, './/tr', $table) as $row) {
+                $owner = $row->parentNode;
+                while ($owner !== null && $owner->nodeName !== 'table') {
+                    $owner = $owner->parentNode;
+                }
+                if ($owner !== $table) {
+                    continue;
+                }
+                $headers = Html::query($xpath, './th', $row);
+                $cells = Html::query($xpath, './td', $row);
+                if ($columns === null) {
+                    if (count($headers) >= 3) {
+                        $columns = self::gradeColumns(array_map(function (DOMElement $th): string {
+                            return Html::text($th, ' ');
+                        }, $headers));
+                        if ($columns === null) {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if (!$cells) {
+                    continue;
+                }
+
+                $rowText = Html::text($row, ' ');
+                if (count($cells) === 1 || preg_match('/Academic\s*Year\s*:/i', $rowText) || preg_match('/\bS?GPA\s*:|\bCGPA\s*:/i', $rowText)) {
+                    if (preg_match('/Academic\s*Year\s*:/i', $rowText)) {
+                        if ($current !== null) {
+                            $semesters[] = $current;
+                        }
+                        $current = Format::semester($rowText);
+                    } elseif (preg_match('/\bS?GPA\s*:|\bCGPA\s*:|Academic\s*Status/i', $rowText)) {
+                        $current = $current ?? Format::semester('');
+                        $current['summary'] = Format::summary($rowText);
+                    }
+                    continue;
+                }
+
+                $value = function (?int $index) use ($cells): string {
+                    return $index !== null && isset($cells[$index]) ? Html::text($cells[$index], ' ') : '';
+                };
+                $code = $value($columns['code']);
+                if (!preg_match('/[A-Za-z]/', $code) || !preg_match('/\d/', $code)) {
+                    continue;
+                }
+                $current = $current ?? Format::semester('');
+                $current['courses'][] = [
+                    'name' => $value($columns['title']),
+                    'code' => strtoupper(str_replace(' ', '', $code)),
+                    'credit' => $value($columns['credit']),
+                    'ects' => $value($columns['ects']),
+                    'grade' => strtoupper($value($columns['grade'])),
+                ];
+            }
+            if ($current !== null) {
+                $semesters[] = $current;
+            }
+        }
+        return array_values(array_filter($semesters, function (array $semester): bool {
+            return $semester['courses'] || $semester['summary'];
+        }));
+    }
+
+    /**
+     * Column positions from grade table headers, or null when it isn't a grade table.
+     *
+     * @param string[] $headers
+     * @return array{title: ?int, code: int, credit: ?int, ects: ?int, grade: int}|null
+     */
+    private static function gradeColumns(array $headers): ?array
+    {
+        $find = function (string $pattern, ?string $exclude = null) use ($headers): ?int {
+            foreach ($headers as $index => $header) {
+                if (preg_match($pattern, $header) && ($exclude === null || !preg_match($exclude, $header))) {
+                    return $index;
+                }
+            }
+            return null;
+        };
+        $code = $find('/code/i');
+        $grade = $find('/grade/i');
+        if ($code === null || $grade === null) {
+            return null;
+        }
+        return [
+            'title' => $find('/title|course|subject/i', '/code/i'),
+            'code' => $code,
+            'credit' => $find('/credit|cr\.?\s*h/i'),
+            'ects' => $find('/ects/i'),
+            'grade' => $grade,
+        ];
+    }
+
+    /**
+     * The portal's mandatory "Student Profile" form, shown until the student completes it.
+     */
+    private static function isProfileFormPage(array $response): bool
+    {
+        return stripos($response['url'], '/StudentRecords/StudentProfile') !== false
+            || stripos($response['body'], 'Fill all required fields and Save') !== false;
+    }
+
+    /**
      * Raw semester blocks from a grade report page: table cells grouped until a CGPA/status cell.
      *
      * @return string[]
@@ -340,11 +498,6 @@ final class PortalClient
             if (preg_match('/Academic\s*Year|CGPA|SGPA|Academic\s*Status/i', $semester)) {
                 return true;
             }
-            foreach (Text::lines($semester) as $line) {
-                if (Format::isCourseCode($line)) {
-                    return true;
-                }
-            }
         }
         return false;
     }
@@ -363,11 +516,14 @@ final class PortalClient
             return null;
         }
 
-        $details = 'Full Name: ' . ($values['name'] !== '' ? $values['name'] : 'N/A') . "\n"
-            . 'ID No.: ' . ($values['id'] !== '' ? $values['id'] : 'N/A') . "\n"
-            . 'Department: ' . ($values['department'] !== '' ? $values['department'] : 'N/A') . "\n"
-            . 'Year: ' . ($values['year'] !== '' ? $values['year'] : 'N/A');
-        return [$this->findPhotoUrl($html), $details];
+        $labels = ['name' => 'Full Name', 'id' => 'ID No.', 'department' => 'Department', 'year' => 'Year'];
+        $lines = [];
+        foreach ($labels as $field => $label) {
+            if ($values[$field] !== '') {
+                $lines[] = "{$label}: {$values[$field]}";
+            }
+        }
+        return [$this->findPhotoUrl($html), implode("\n", $lines)];
     }
 
     /**
@@ -485,6 +641,9 @@ final class PortalClient
         $title = $info['title'] !== '' ? $info['title'] : ($info['headings'][0] ?? $info['path']);
         $haystack = strtolower($info['path'] . ' ' . $info['title'] . ' ' . implode(' ', $info['headings']) . ' ' . implode(' ', $info['forms']));
 
+        if (self::isProfileFormPage($response)) {
+            return self::PROFILE_FORM_NOTICE;
+        }
         if (preg_match('/change\s*password|changepassword|reset\s*password/', $haystack)) {
             return "🔐 The portal is asking you to change your password first.\n\n"
                 . "Open https://portal.wcu.edu.et/ in a browser, log in, change your password, then come back and log in here with the new password.";

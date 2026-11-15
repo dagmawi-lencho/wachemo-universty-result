@@ -3,19 +3,19 @@
 declare(strict_types=1);
 
 /**
- * Turns raw scraped semester text into Telegram-friendly messages.
+ * Builds structured semesters from scraped text and turns them into Telegram-friendly messages.
+ *
+ * A semester is: ['title' => string, 'year' => '2025/26' or '', 'label' => 'Year II • Semester 2',
+ * 'courses' => [['name', 'code', 'credit', 'ects', 'grade'], ...], 'summary' => ['SGPA' => '3.5', ...]].
  */
 final class Format
 {
     private const GRADES = ['A+', 'A', 'A-', 'B+', 'B', 'B-', 'C+', 'C', 'C-', 'D+', 'D', 'D-', 'F', 'PASS', 'FAIL'];
     private const SEMESTER_NAMES = [
-        'one' => 'Semester 1',
-        'two' => 'Semester 2',
-        'i' => 'Semester 1',
-        'ii' => 'Semester 2',
-        '1' => 'Semester 1',
-        '2' => 'Semester 2',
+        'one' => '1', 'two' => '2', 'three' => '3', 'i' => '1', 'ii' => '2', 'iii' => '3',
+        'first' => '1', 'second' => '2', 'third' => '3', 'summer' => 'Summer',
     ];
+    private const SUMMARY_LABELS = ['SGP', 'SGPA', 'CGP', 'CGPA'];
 
     public static function isCourseCode(string $value): bool
     {
@@ -27,114 +27,158 @@ final class Format
         return in_array(strtoupper(Text::strip($value)), self::GRADES, true);
     }
 
-    public static function semesterText(string $raw): string
+    /**
+     * An empty semester from its header, e.g. "Academic Year : 2025/26, Year II, Semester : Two".
+     */
+    public static function semester(string $title): array
     {
-        $lines = Text::lines($raw);
-        if (!$lines) {
-            return 'No semester data found.';
-        }
-        $joined = implode(' ', $lines);
+        $title = Text::strip(preg_replace('/(*UCP)\s+/u', ' ', $title));
+        $year = self::search('/(*UCP)Academic\s*Year\s*:\s*(\d{4}\s*\/\s*\d{2,4})/iu', $title);
+        $level = self::search('/(*UCP)(?:^|[,;|])\s*Year\s*:?\s*([IVX]+|\d+)\b/iu', $title);
+        $term = self::search('/(*UCP)Semester\s*:?\s*([A-Za-z0-9]+)/iu', $title);
 
-        $academic = self::search('/(Academic Year:[^A]+(?:Semester:[^\n]+)?)/iu', $joined);
-        $stats = [];
-        foreach (['SGP', 'SGPA', 'CGP', 'CGPA'] as $label) {
-            $value = self::search('/(*UCP)' . $label . '\s*:\s*([\d.]+)/iu', $joined);
+        $parts = [];
+        if ($level !== null) {
+            $parts[] = 'Year ' . strtoupper($level);
+        }
+        if ($term !== null) {
+            $parts[] = 'Semester ' . (self::SEMESTER_NAMES[strtolower($term)] ?? $term);
+        }
+        return [
+            'title' => $title,
+            'year' => $year !== null ? str_replace(' ', '', $year) : '',
+            'label' => $parts ? implode(' • ', $parts) : 'Semester',
+            'courses' => [],
+            'summary' => [],
+        ];
+    }
+
+    /**
+     * Values from a row like "SGP : 60.5 SGPA : 3.25 CGP : 282.25 CGPA : 3.1 Academic Status : Promoted".
+     *
+     * @return array<string, string>
+     */
+    public static function summary(string $text): array
+    {
+        $summary = [];
+        foreach (self::SUMMARY_LABELS as $label) {
+            $value = self::search('/(*UCP)\b' . $label . '\s*:\s*([\d.]+)/iu', $text);
             if ($value !== null) {
-                $stats[] = "{$label}: {$value}";
+                $summary[$label] = $value;
             }
         }
-        $status = self::search('/(*UCP)Academic Status\s*:\s*([A-Za-z ]+)/iu', $joined);
-        if ($status !== null) {
-            $stats[] = 'Status: ' . Text::strip($status);
+        $status = self::search('/(*UCP)Academic\s*Status\s*:\s*([^\n:]+?)\s*(?:\b(?:SGP|SGPA|CGP|CGPA)\s*:|$)/iu', Text::strip($text));
+        if ($status !== null && $status !== '') {
+            $summary['Status'] = $status;
         }
+        return $summary;
+    }
 
-        $courses = [];
+    /**
+     * A semester from raw cell text (one cell per line), for grade pages in an unknown layout.
+     */
+    public static function semesterFromRaw(string $raw): array
+    {
+        $lines = Text::lines($raw);
+        $joined = implode(' ', $lines);
+        $header = self::search('/(*UCP)(Academic\s*Year\s*:.*?Semester\s*:?\s*[A-Za-z0-9]+)/iu', $joined)
+            ?? (self::search('/(*UCP)(Academic\s*Year\s*:\s*\d{4}\s*\/\s*\d{2,4})/iu', $joined) ?? '');
+        $semester = self::semester($header);
+        $semester['summary'] = self::summary($joined);
+
         $count = count($lines);
         $i = 0;
         while ($i < $count) {
             if ($i + 1 < $count && self::isCourseCode($lines[$i + 1])) {
-                $grade = '-';
+                $grade = '';
                 $step = 2;
-                if ($i + 2 < $count && self::isGradeValue($lines[$i + 2])) {
-                    $grade = strtoupper($lines[$i + 2]);
-                    $step = 3;
+                for ($j = $i + 2; $j < min($count, $i + 6); $j++) {
+                    if (self::isGradeValue($lines[$j])) {
+                        $grade = strtoupper(Text::strip($lines[$j]));
+                        $step = $j - $i + 1;
+                        break;
+                    }
+                    if ($j + 1 < $count && self::isCourseCode($lines[$j + 1])) {
+                        break;
+                    }
                 }
-                $courses[] = [$lines[$i], strtoupper(str_replace(' ', '', $lines[$i + 1])), $grade];
+                $semester['courses'][] = [
+                    'name' => $lines[$i],
+                    'code' => strtoupper(str_replace(' ', '', $lines[$i + 1])),
+                    'credit' => '',
+                    'ects' => '',
+                    'grade' => $grade,
+                ];
                 $i += $step;
                 continue;
             }
             $i++;
         }
+        return $semester;
+    }
 
+    public static function semesterText(array $semester): string
+    {
         $output = ['📚 Semester Result'];
-        if ($academic !== null) {
-            $output[] = "\n🗓 " . Text::strip($academic);
+        if ($semester['title'] !== '') {
+            $output[] = "\n🗓 {$semester['title']}";
         }
-        if ($courses) {
+
+        if ($semester['courses']) {
             $output[] = "\n📖 Courses";
-            foreach ($courses as $index => [$name, $code, $grade]) {
-                $output[] = ($index + 1) . ". {$name}";
-                $output[] = "   • Code: {$code}";
-                $output[] = "   • Grade: {$grade}";
+            foreach ($semester['courses'] as $index => $course) {
+                $output[] = ($index + 1) . ". {$course['name']}";
+                $output[] = "   • Code: {$course['code']}";
+                $hours = self::hours($course);
+                if ($hours !== '') {
+                    $output[] = "   • {$hours}";
+                }
+                $output[] = '   • Grade: ' . ($course['grade'] !== '' ? $course['grade'] : 'not released yet');
+            }
+            if (!self::hasGrades($semester)) {
+                $output[] = "\nℹ️ The portal has not released grades for this semester yet.";
             }
         } else {
-            $output[] = "\nNo course rows parsed from this page.";
-        }
-        if ($stats) {
-            $output[] = "\n📊 Summary";
-            foreach ($stats as $item) {
-                $output[] = "• {$item}";
-            }
+            $output[] = "\nNo courses listed for this semester.";
         }
 
+        if ($semester['summary']) {
+            $output[] = "\n📊 Summary";
+            foreach ($semester['summary'] as $label => $value) {
+                $output[] = "• {$label}: {$value}";
+            }
+        }
         return implode("\n", $output);
     }
 
-    public static function registeredCoursesText(string $raw): string
+    public static function registeredCoursesText(array $semester): string
     {
-        $lines = Text::lines($raw);
-        $year = self::academicYear($raw);
-        $semester = self::semesterLabel($raw);
-
-        $courses = [];
-        $count = count($lines);
-        $i = 0;
-        while ($i < $count) {
-            if ($i + 1 < $count && self::isCourseCode($lines[$i + 1])) {
-                $courses[] = [$lines[$i], strtoupper(str_replace(' ', '', $lines[$i + 1]))];
-                $i += 2;
-                continue;
-            }
-            $i++;
-        }
-
-        $output = ["📚 Registered Courses\n\n🗓 Academic Year: {$year}\n🧾 {$semester}"];
-        if (!$courses) {
+        $year = $semester['year'] !== '' ? $semester['year'] : 'Not shown';
+        $output = ["📚 Registered Courses\n\n🗓 Academic Year: {$year}\n🧾 {$semester['label']}"];
+        if (!$semester['courses']) {
             $output[] = "\nNo registered courses found for this semester.";
             return implode("\n", $output);
         }
         $output[] = "\n📖 Course List";
-        foreach ($courses as $index => [$name, $code]) {
-            $output[] = ($index + 1) . ". {$name}";
-            $output[] = "   • Code: {$code}";
+        foreach ($semester['courses'] as $index => $course) {
+            $output[] = ($index + 1) . ". {$course['name']}";
+            $output[] = "   • Code: {$course['code']}";
+            $hours = self::hours($course);
+            if ($hours !== '') {
+                $output[] = "   • {$hours}";
+            }
         }
         return implode("\n", $output);
     }
 
-    public static function academicYear(string $raw): string
+    public static function hasGrades(array $semester): bool
     {
-        $year = self::search('/(*UCP)Academic Year\s*:\s*(\d{4}\s*\/\s*\d{2,4})/iu', $raw);
-        return $year !== null ? str_replace(' ', '', $year) : 'Other';
-    }
-
-    public static function semesterLabel(string $raw): string
-    {
-        $value = self::search('/(*UCP)Semester\s*:\s*([A-Za-z0-9]+)/iu', $raw);
-        if ($value === null) {
-            return 'Semester';
+        foreach ($semester['courses'] as $course) {
+            if ($course['grade'] !== '') {
+                return true;
+            }
         }
-        $value = Text::strip($value);
-        return self::SEMESTER_NAMES[strtolower($value)] ?? "Semester {$value}";
+        return false;
     }
 
     /**
@@ -148,8 +192,20 @@ final class Format
         return Text::slice($text, $limit - 30) . "\n\n...truncated for Telegram limit.";
     }
 
+    private static function hours(array $course): string
+    {
+        $parts = [];
+        if ($course['credit'] !== '') {
+            $parts[] = "Credit: {$course['credit']}";
+        }
+        if ($course['ects'] !== '') {
+            $parts[] = "ECTS: {$course['ects']}";
+        }
+        return implode(' | ', $parts);
+    }
+
     private static function search(string $pattern, string $subject): ?string
     {
-        return preg_match($pattern, $subject, $match) ? $match[1] : null;
+        return preg_match($pattern, $subject, $match) ? Text::strip($match[1]) : null;
     }
 }

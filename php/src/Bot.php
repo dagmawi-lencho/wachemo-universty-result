@@ -367,10 +367,11 @@ final class Bot
             }
 
             $entriesByYear = [];
-            foreach ($grades as $raw) {
-                $entriesByYear[Format::academicYear($raw)][] = [
-                    'semester_label' => Format::semesterLabel($raw),
-                    'raw' => $raw,
+            foreach ($grades as $semester) {
+                $year = $semester['year'] !== '' ? $semester['year'] : 'Other';
+                $entriesByYear[$year][] = [
+                    'semester_label' => $semester['label'],
+                    'semester' => $semester,
                 ];
             }
             $years = array_map('strval', array_keys($entriesByYear));
@@ -434,12 +435,16 @@ final class Bot
         }
 
         $entry = $entries[$index];
-        $raw = (string) ($entry['raw'] ?? '');
+        if (!isset($entry['semester']) || !is_array($entry['semester'])) {
+            $this->renderPanel('This menu is out of date. Please choose again.', self::mainMenuMarkup());
+            return;
+        }
+        $semester = $entry['semester'];
         $label = (string) ($entry['semester_label'] ?? 'Semester');
         $year = (string) ($this->data['selected_year'] ?? '');
         $body = ($this->data['pending_action'] ?? 'grade') === 'courses'
-            ? Format::registeredCoursesText($raw)
-            : Format::semesterText($raw);
+            ? Format::registeredCoursesText($semester)
+            : Format::semesterText($semester);
 
         $this->renderPanel(
             Format::clamp($body . "\n\n🗓 {$year} • {$label}\n\n🤖 WCU RESULT"),
