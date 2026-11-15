@@ -515,9 +515,12 @@ final class Bot
             "🔒 **Privacy Policy**\n\n"
             . "Hello {$user},\n\n"
             . "At WCU RESULT, we take your privacy seriously. Here's how we handle your data:\n\n"
-            . "1. **No Data Storage**: We do not store your student ID, password, or any personal information.\n"
-            . "2. **Secure Communication**: All data is transmitted securely using encryption.\n"
-            . "3. **Transparency**: Your records are fetched from the official WCU portal.\n\n"
+            . "1. **Password**: Your password is never saved. It is used once to log in to the portal and the message is deleted.\n"
+            . "2. **Temporary data**: While you use the bot, your portal session and the results you open are kept encrypted. "
+            . "The login expires after 30 minutes of inactivity and the data is deleted automatically within 24 hours.\n"
+            . "3. **Secure Communication**: All data is transmitted securely using encryption (HTTPS).\n"
+            . "4. **No sharing**: Your data is only shown to you. It is never sold or shared.\n"
+            . "5. **Transparency**: Your records are fetched from the official WCU portal, read-only.\n\n"
             . 'If you have any concerns, feel free to reach out to the bot developer.',
             self::removeKeyboard(),
             'Markdown'
